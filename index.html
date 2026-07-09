@@ -8,6 +8,9 @@
   * { box-sizing: border-box; }
   body { margin: 0; padding: 0; background: #000; }
   #root { min-height: 100vh; }
+  .tap { transition: transform 0.1s ease, opacity 0.1s ease; }
+  .tap:active { transform: scale(0.96); opacity: 0.85; }
+  ::-webkit-scrollbar { display: none; }
 </style>
 
 <!-- React (CDN) -->
@@ -65,13 +68,51 @@ const DEFAULT_PROGRAMS = {
   },
 };
 
-const SCHEDULE = [
-  { key: "B", label: "Today"       },
-  { key: "C", label: "Sat, 13 Jun" },
-  { key: "A", label: "Sun, 14 Jun" },
-  { key: "C", label: "Tue, 16 Jun" },
-  { key: "B", label: "Wed, 17 Jun" },
-];
+const ROTATION = ["A", "B", "C"];
+
+function buildSchedule(history, count = 5) {
+  const order = ROTATION;
+  let startIdx = 0;
+  if (history.length) {
+    const lastKey = history[0].progKey;
+    const li = order.indexOf(lastKey);
+    startIdx = li >= 0 ? (li + 1) % order.length : 0;
+  }
+  const today = new Date();
+  const sched = [];
+  for (let i = 0; i < count; i++) {
+    const key = order[(startIdx + i) % order.length];
+    const d = new Date(today);
+    d.setDate(d.getDate() + i * 2);
+    const label = i === 0 ? "Today" : d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+    sched.push({ key, label });
+  }
+  return sched;
+}
+
+// ── Units ─────────────────────────────────────────────────────────────────────
+const LB_PER_KG = 2.20462;
+function toDisplayWeight(kg, units) {
+  if (units === "lb") return Math.round(kg * LB_PER_KG * 10) / 10;
+  return kg;
+}
+function fromDisplayWeight(val, units) {
+  if (units === "lb") return Math.round((val / LB_PER_KG) * 100) / 100;
+  return val;
+}
+
+const PLATE_PROFILES = {
+  kg: { barbell: 20, plates: [25, 20, 15, 10, 5, 2.5, 1.25] },
+  lb: { barbell: 45, plates: [45, 35, 25, 10, 5, 2.5] },
+};
+const PLATE_COLORS_LB = {
+  45: "#e63946", 35: "#457b9d", 25: "#f4a261", 10: "#2d6a4f", 5: "#e9c46a", 2.5: "#adb5bd",
+};
+
+// ── Haptics ───────────────────────────────────────────────────────────────────
+function vibrate(pattern) {
+  try { if (navigator.vibrate) navigator.vibrate(pattern); } catch (e) { /* silent fail */ }
+}
 
 // ── Colours ───────────────────────────────────────────────────────────────────
 const RED   = "#e8392a";
@@ -84,9 +125,8 @@ const GREEN = "#34c759";
 const ORANGE = "#f97316";
 
 // ── Warmup calculator ─────────────────────────────────────────────────────────
-function calcWarmups(workingWeight) {
+function calcWarmups(workingWeight, bar = BARBELL_WEIGHT) {
   const round = (w) => Math.round(w / 2.5) * 2.5;
-  const bar   = BARBELL_WEIGHT;
   if (workingWeight <= bar + 2.5) return [];
   const steps = [];
   steps.push({ pct: 0, weight: bar, reps: 10, note: "Bar only" });
@@ -116,12 +156,12 @@ function calcWarmups(workingWeight) {
 }
 
 // ── Plate calculator ──────────────────────────────────────────────────────────
-function calcPlates(totalKg) {
-  const perSide = (totalKg - BARBELL_WEIGHT) / 2;
+function calcPlates(totalKg, bar = BARBELL_WEIGHT, availablePlates = AVAILABLE_PLATES) {
+  const perSide = (totalKg - bar) / 2;
   if (perSide <= 0) return [];
   let remaining = perSide;
   const result = [];
-  for (const p of AVAILABLE_PLATES) {
+  for (const p of availablePlates) {
     if (remaining <= 0) break;
     const count = Math.floor(remaining / p);
     if (count > 0) {
@@ -156,10 +196,10 @@ function playBell() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function fmtWeight(ex) {
+function fmtWeight(ex, units = "kg") {
   if (ex.unit === "sec") return `${ex.sets}×${ex.reps}sec`;
   if (ex.weight === 0)   return `${ex.sets}×${ex.reps}`;
-  return `${ex.sets}×${ex.reps} ${ex.weight}kg`;
+  return `${ex.sets}×${ex.reps} ${toDisplayWeight(ex.weight, units)}${units}`;
 }
 
 function fmtTime(s) {
@@ -186,6 +226,59 @@ function saveState(state) {
   } catch (e) {
     console.error("Save failed", e);
   }
+}
+
+// ── Swipeable row (swipe-left to reveal delete) ───────────────────────────────
+function SwipeableRow({ children, onDelete, style }) {
+  const [open, setOpen] = useState(false);
+  const [dragX, setDragX] = useState(null);
+  const startX = useRef(0);
+  const REVEAL = -76;
+
+  const base = open ? REVEAL : 0;
+  const x = dragX !== null ? dragX : base;
+
+  function handleTouchStart(e) {
+    startX.current = e.touches[0].clientX;
+    setDragX(base);
+  }
+  function handleTouchMove(e) {
+    const delta = e.touches[0].clientX - startX.current;
+    let next = base + delta;
+    next = Math.max(REVEAL, Math.min(0, next));
+    setDragX(next);
+  }
+  function handleTouchEnd() {
+    if (dragX === null) return;
+    setOpen(dragX < REVEAL / 2);
+    setDragX(null);
+  }
+
+  return (
+    <div style={{ position: "relative", overflow: "hidden", borderRadius: 14, ...style }}>
+      <div
+        onClick={() => { onDelete(); setOpen(false); }}
+        style={{
+          position: "absolute", right: 0, top: 0, bottom: 0, width: 76,
+          background: "#b8281a", display: "flex", alignItems: "center", justifyContent: "center",
+          cursor: "pointer",
+        }}>
+        <span style={{ color: WHITE, fontSize: 13, fontWeight: 700 }}>Delete</span>
+      </div>
+      <div
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        style={{
+          transform: `translateX(${x}px)`,
+          transition: dragX === null ? "transform 0.2s ease" : "none",
+          background: CARD,
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
 }
 
 // ── Circle set button ─────────────────────────────────────────────────────────
@@ -347,7 +440,7 @@ function PlankTimer({ seconds, exName, onComplete, onCancel }) {
 }
 
 // ── Active Workout Screen ─────────────────────────────────────────────────────
-function WorkoutScreen({ progKey, programs, onFinish, onBack, onWeightsChange }) {
+function WorkoutScreen({ progKey, programs, units, onFinish, onBack, onWeightsChange }) {
   const prog = programs[progKey];
 
   const [done, setDone] = useState(() => {
@@ -366,13 +459,14 @@ function WorkoutScreen({ progKey, programs, onFinish, onBack, onWeightsChange })
   const [editIdx, setEditIdx]     = useState(null);
   const [resultBanner, setResultBanner] = useState({});
   const [plankRun, setPlankRun]   = useState(null);
+  const [note, setNote]           = useState("");
 
   function toggleWarmup(exIdx, wsIdx, sIdx) {
     const key = `${exIdx}-${wsIdx}-${sIdx}`;
     setWarmupDone(prev => {
       const next = { ...prev };
       if (next[key]) delete next[key];
-      else { next[key] = true; setShowTimer(true); }
+      else { next[key] = true; setShowTimer(true); vibrate(20); }
       return next;
     });
   }
@@ -388,6 +482,7 @@ function WorkoutScreen({ progKey, programs, onFinish, onBack, onWeightsChange })
     const isTimeBased = ex.unit === "sec";
 
     if (allFull) {
+      vibrate([30, 50, 30]);
       setWeights(p => p.map((v, i) => {
         if (i !== exIdx) return v;
         if (isTimeBased) return { ...v, reps: v.reps + TIME_PROGRESSION_INCREMENT, failStreak: 0 };
@@ -452,7 +547,7 @@ function WorkoutScreen({ progKey, programs, onFinish, onBack, onWeightsChange })
       if (next === undefined) delete copy[exIdx][setIdx];
       else copy[exIdx][setIdx] = next;
 
-      if (current === undefined && next !== undefined && !isTimeBased) setShowTimer(true);
+      if (current === undefined && next !== undefined && !isTimeBased) { setShowTimer(true); vibrate(20); }
 
       const totalSets = weights[exIdx].sets;
       if (Object.keys(copy[exIdx]).length === totalSets) {
@@ -485,8 +580,8 @@ function WorkoutScreen({ progKey, programs, onFinish, onBack, onWeightsChange })
   }
 
   useEffect(() => {
-    onWeightsChange(progKey, weights, done);
-  }, [weights, done]);
+    onWeightsChange(progKey, weights, done, note);
+  }, [weights, done, note]);
 
   function adjustSets(exIdx, delta) {
     setWeights(p => p.map((v, i) => i === exIdx ? { ...v, sets: Math.max(1, v.sets + delta) } : v));
@@ -521,9 +616,12 @@ function WorkoutScreen({ progKey, programs, onFinish, onBack, onWeightsChange })
           const w = weights[exIdx];
           const exWithWeight = { ...ex, ...w };
           const isEditing = editIdx === exIdx;
+          const profile = PLATE_PROFILES[units] || PLATE_PROFILES.kg;
+          const plateColors = units === "lb" ? PLATE_COLORS_LB : PLATE_COLORS;
+          const displayWorking = toDisplayWeight(w.weight, units);
           const isBarbell = !ex.unit && w.weight >= BARBELL_WEIGHT;
-          const plates = isBarbell ? calcPlates(w.weight) : [];
-          const warmupSets = isBarbell ? calcWarmups(w.weight) : [];
+          const plates = isBarbell ? calcPlates(displayWorking, profile.barbell, profile.plates) : [];
+          const warmupSets = isBarbell ? calcWarmups(displayWorking, profile.barbell) : [];
           const banner = resultBanner[exIdx];
 
           return (
@@ -532,36 +630,70 @@ function WorkoutScreen({ progKey, programs, onFinish, onBack, onWeightsChange })
                 <span style={{ color: WHITE, fontSize: 16, fontWeight: 600 }}>{ex.name}</span>
                 {!ex.unit ? (
                   isEditing ? (
-                    <div style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={e => e.stopPropagation()}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }} onClick={e => e.stopPropagation()}>
                       <input
                         autoFocus
                         type="text"
-                        inputMode="decimal"
-                        defaultValue={w.weight}
+                        inputMode="numeric"
+                        defaultValue={w.reps}
+                        onBlur={e => {
+                          const val = parseInt(e.target.value, 10) || w.reps;
+                          setWeights(p => p.map((v, i) => i === exIdx ? { ...v, reps: val } : v));
+                        }}
                         onKeyDown={e => {
-                          if (e.key === "Enter") {
-                            const val = parseFloat(e.target.value) || 0;
-                            setWeights(p => p.map((v, i) => i === exIdx ? { ...v, weight: val } : v));
-                            setEditIdx(null);
-                          }
+                          if (e.key === "Enter") e.target.blur();
                           if (e.key === "Escape") setEditIdx(null);
                         }}
+                        style={{ width: 34, background: "none", border: "none", borderBottom: `1px solid ${RED}`, color: RED, fontSize: 16, fontWeight: 700, textAlign: "center", outline: "none" }}
+                      />
+                      <span style={{ color: GREY, fontSize: 12 }}>reps</span>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        defaultValue={displayWorking}
                         onBlur={e => {
                           const val = parseFloat(e.target.value) || 0;
-                          setWeights(p => p.map((v, i) => i === exIdx ? { ...v, weight: val } : v));
-                          setEditIdx(null);
+                          const kgVal = fromDisplayWeight(val, units);
+                          setWeights(p => p.map((v, i) => i === exIdx ? { ...v, weight: kgVal } : v));
                         }}
-                        style={{ width: 64, background: "none", border: "none", borderBottom: `1px solid ${RED}`, color: RED, fontSize: 17, fontWeight: 700, textAlign: "center", outline: "none" }}
+                        onKeyDown={e => {
+                          if (e.key === "Enter") e.target.blur();
+                          if (e.key === "Escape") setEditIdx(null);
+                        }}
+                        style={{ width: 56, background: "none", border: "none", borderBottom: `1px solid ${RED}`, color: RED, fontSize: 16, fontWeight: 700, textAlign: "center", outline: "none" }}
                       />
-                      <span style={{ color: GREY, fontSize: 13 }}>kg</span>
+                      <span style={{ color: GREY, fontSize: 12 }}>{units}</span>
+                      <span onClick={() => setEditIdx(null)} style={{ color: GREEN, fontSize: 20, cursor: "pointer", marginLeft: 2 }}>✓</span>
                     </div>
                   ) : (
                     <span onClick={() => setEditIdx(exIdx)} style={{ color: RED, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
-                      {w.sets}×{w.reps} {w.weight}kg ›
+                      {w.sets}×{w.reps} {displayWorking}{units} ›
                     </span>
                   )
                 ) : (
-                  <span style={{ color: RED, fontSize: 14, fontWeight: 600 }}>{fmtWeight(exWithWeight)}</span>
+                  isEditing ? (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }} onClick={e => e.stopPropagation()}>
+                      <input
+                        autoFocus
+                        type="text"
+                        inputMode="numeric"
+                        defaultValue={w.reps}
+                        onBlur={e => {
+                          const val = parseInt(e.target.value, 10) || w.reps;
+                          setWeights(p => p.map((v, i) => i === exIdx ? { ...v, reps: val } : v));
+                        }}
+                        onKeyDown={e => {
+                          if (e.key === "Enter") e.target.blur();
+                          if (e.key === "Escape") setEditIdx(null);
+                        }}
+                        style={{ width: 40, background: "none", border: "none", borderBottom: `1px solid ${RED}`, color: RED, fontSize: 16, fontWeight: 700, textAlign: "center", outline: "none" }}
+                      />
+                      <span style={{ color: GREY, fontSize: 12 }}>sec</span>
+                      <span onClick={() => setEditIdx(null)} style={{ color: GREEN, fontSize: 20, cursor: "pointer", marginLeft: 2 }}>✓</span>
+                    </div>
+                  ) : (
+                    <span onClick={() => setEditIdx(exIdx)} style={{ color: RED, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>{fmtWeight(exWithWeight, units)} ›</span>
+                  )
                 )}
               </div>
 
@@ -594,7 +726,7 @@ function WorkoutScreen({ progKey, programs, onFinish, onBack, onWeightsChange })
                         size={40}
                         accent={ORANGE}
                       />
-                      <span style={{ color: GREY, fontSize: 13 }}>{ws.weight}kg — {ws.note}</span>
+                      <span style={{ color: GREY, fontSize: 13 }}>{ws.weight}{units} — {ws.note}</span>
                     </div>
                   ))}
                   <div style={{ color: WHITE, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", marginTop: 10, marginBottom: 6 }}>
@@ -638,30 +770,30 @@ function WorkoutScreen({ progKey, programs, onFinish, onBack, onWeightsChange })
                     <div style={{ width: 6, height: 8, background: "#555", borderRadius: 1 }} />
                     {[...plates].reverse().flatMap((p, i) =>
                       Array.from({ length: p.count }).map((_, j) => (
-                        <div key={`l${i}${j}`} style={{ width: 8, height: 20 + p.weight * 0.5, background: PLATE_COLORS[p.weight] || "#aaa", borderRadius: 2 }} />
+                        <div key={`l${i}${j}`} style={{ width: 8, height: 20 + p.weight * 0.5, background: plateColors[p.weight] || "#aaa", borderRadius: 2 }} />
                       ))
                     )}
                     <div style={{ width: 40, height: 8, background: "#555", borderRadius: 3, margin: "0 3px" }} />
                     {plates.flatMap((p, i) =>
                       Array.from({ length: p.count }).map((_, j) => (
-                        <div key={`r${i}${j}`} style={{ width: 8, height: 20 + p.weight * 0.5, background: PLATE_COLORS[p.weight] || "#aaa", borderRadius: 2 }} />
+                        <div key={`r${i}${j}`} style={{ width: 8, height: 20 + p.weight * 0.5, background: plateColors[p.weight] || "#aaa", borderRadius: 2 }} />
                       ))
                     )}
                     <div style={{ width: 6, height: 8, background: "#555", borderRadius: 1 }} />
                   </div>
                   {plates.length === 0 ? (
-                    <div style={{ color: GREY, fontSize: 12, textAlign: "center" }}>Bar only — {BARBELL_WEIGHT}kg</div>
+                    <div style={{ color: GREY, fontSize: 12, textAlign: "center" }}>Bar only — {profile.barbell}{units}</div>
                   ) : (
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "center" }}>
                       {plates.map((p, i) => (
                         <div key={i} style={{ display: "flex", alignItems: "center", gap: 4, background: "#1a1a1a", borderRadius: 6, padding: "4px 8px" }}>
-                          <div style={{ width: 8, height: 8, borderRadius: 2, background: PLATE_COLORS[p.weight] || "#aaa" }} />
-                          <span style={{ color: WHITE, fontSize: 12, fontWeight: 600 }}>{p.weight}kg</span>
+                          <div style={{ width: 8, height: 8, borderRadius: 2, background: plateColors[p.weight] || "#aaa" }} />
+                          <span style={{ color: WHITE, fontSize: 12, fontWeight: 600 }}>{p.weight}{units}</span>
                           <span style={{ color: GREY, fontSize: 11 }}>×{p.count}</span>
                         </div>
                       ))}
                       <div style={{ display: "flex", alignItems: "center", gap: 4, background: "#1a1a1a", borderRadius: 6, padding: "4px 8px" }}>
-                        <span style={{ color: GREY, fontSize: 11 }}>bar {BARBELL_WEIGHT}kg</span>
+                        <span style={{ color: GREY, fontSize: 11 }}>bar {profile.barbell}{units}</span>
                       </div>
                     </div>
                   )}
@@ -672,6 +804,23 @@ function WorkoutScreen({ progKey, programs, onFinish, onBack, onWeightsChange })
             </div>
           );
         })}
+      </div>
+
+      <div style={{ padding: "4px 16px 16px" }}>
+        <div style={{ color: GREY, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>
+          Notes
+        </div>
+        <textarea
+          value={note}
+          onChange={e => setNote(e.target.value)}
+          placeholder="How did it feel? Aches, energy, anything to remember..."
+          rows={3}
+          style={{
+            width: "100%", background: CARD, border: `1px solid ${DIM}`, borderRadius: 10,
+            padding: 10, color: WHITE, fontSize: 14, resize: "vertical", outline: "none",
+            fontFamily: "inherit",
+          }}
+        />
       </div>
 
       {showTimer && <RestTimer onDismiss={() => setShowTimer(false)} />}
@@ -687,46 +836,98 @@ function WorkoutScreen({ progKey, programs, onFinish, onBack, onWeightsChange })
   );
 }
 
+// ── Weekly activity helpers ───────────────────────────────────────────────────
+function getWeekStrip(history) {
+  const trainedSet = new Set(history.map(h => h.isoDate).filter(Boolean));
+  const today = new Date();
+  const days = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const iso = d.toISOString().slice(0, 10);
+    days.push({
+      label: d.toLocaleDateString("en-US", { weekday: "narrow" }),
+      trained: trainedSet.has(iso),
+      isToday: i === 0,
+    });
+  }
+  return days;
+}
+
 // ── Home Screen ───────────────────────────────────────────────────────────────
-function HomeScreen({ programs, onStart }) {
-  const [expanded, setExpanded] = useState(null);
+function HomeScreen({ programs, history, units, onStart }) {
+  const schedule = buildSchedule(history);
+  const next = schedule[0];
+  const upcoming = schedule.slice(1);
+  const prog = programs[next.key];
+  const days = getWeekStrip(history);
+  const weekCount = days.filter(d => d.trained).length;
+  const totalCount = history.length;
+
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: "0 0 20px" }}>
-      {SCHEDULE.map((s, i) => {
-        const prog = programs[s.key];
-        const preview = prog.exercises.slice(0, 3);
-        const extra   = prog.exercises.length - 3;
-        const isOpen  = expanded === i;
-        return (
-          <div key={i} style={{ background: CARD, borderRadius: 14, margin: "12px 16px 0", padding: "14px 16px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
-              <span style={{ color: GREY, fontSize: 14 }}>{prog.name}</span>
-              <span style={{ color: GREY, fontSize: 14 }}>{s.label}</span>
+      {/* Weekly activity strip */}
+      <div style={{ background: CARD, borderRadius: 14, margin: "12px 16px 0", padding: "14px 16px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
+          <span style={{ color: WHITE, fontSize: 13, fontWeight: 700 }}>{weekCount} workout{weekCount !== 1 ? "s" : ""} this week</span>
+          <span style={{ color: GREY, fontSize: 13 }}>{totalCount} total</span>
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          {days.map((d, i) => (
+            <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+              <span style={{ color: d.isToday ? WHITE : GREY, fontSize: 11, fontWeight: d.isToday ? 700 : 400 }}>{d.label}</span>
+              <div style={{
+                width: 10, height: 10, borderRadius: "50%",
+                background: d.trained ? RED : DIM,
+                outline: d.isToday ? `2px solid ${WHITE}` : "none",
+                outlineOffset: 2,
+              }} />
             </div>
-            {(isOpen ? prog.exercises : preview).map((ex, j) => (
-              <div key={j} style={{ display: "flex", justifyContent: "space-between", paddingBottom: 6 }}>
-                <span style={{ color: WHITE, fontSize: 15 }}>{ex.name}</span>
-                <span style={{ color: WHITE, fontSize: 15 }}>{fmtWeight(ex)}</span>
-              </div>
-            ))}
-            {!isOpen && extra > 0 && (
-              <div onClick={() => setExpanded(i)} style={{ color: GREY, fontSize: 13, marginTop: 4, cursor: "pointer" }}>
-                +{extra} exercises
-              </div>
-            )}
-            {isOpen && (
-              <div onClick={() => setExpanded(null)} style={{ color: GREY, fontSize: 13, marginTop: 4, cursor: "pointer" }}>
-                Show less
-              </div>
-            )}
-            <button onClick={() => onStart(s.key)} style={{
-              width: "100%", marginTop: 14,
-              background: i === 0 ? RED : "transparent",
-              border: i === 0 ? "none" : `1px solid ${RED}`,
-              borderRadius: 28, padding: "13px 0", color: i === 0 ? WHITE : RED,
-              fontSize: 16, fontWeight: 700, cursor: "pointer",
+          ))}
+        </div>
+      </div>
+
+      {/* Next workout hero */}
+      <div style={{ background: CARD, borderRadius: 14, margin: "12px 16px 0", padding: "16px 16px 14px" }}>
+        <div style={{ color: RED, fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 4 }}>
+          Next Workout
+        </div>
+        <div style={{ color: WHITE, fontSize: 22, fontWeight: 700, marginBottom: 14 }}>{prog.name}</div>
+        {prog.exercises.map((ex, j) => (
+          <div key={j} style={{ display: "flex", justifyContent: "space-between", paddingBottom: 7 }}>
+            <span style={{ color: WHITE, fontSize: 15 }}>{ex.name}</span>
+            <span style={{ color: GREY, fontSize: 15 }}>{fmtWeight(ex, units)}</span>
+          </div>
+        ))}
+        <button className="tap" onClick={() => onStart(next.key)} style={{
+          width: "100%", marginTop: 14, background: RED, border: "none",
+          borderRadius: 28, padding: "15px 0", color: WHITE,
+          fontSize: 17, fontWeight: 700, cursor: "pointer",
+        }}>
+          Start Workout
+        </button>
+      </div>
+
+      {/* Upcoming compact list */}
+      <div style={{ color: GREY, fontSize: 13, padding: "18px 16px 6px", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        Upcoming
+      </div>
+      {upcoming.map((s, i) => {
+        const p = programs[s.key];
+        return (
+          <div key={i} style={{
+            background: CARD, borderRadius: 14, margin: "6px 16px 0", padding: "12px 16px",
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+          }}>
+            <div>
+              <div style={{ color: WHITE, fontSize: 15, fontWeight: 600 }}>{p.name}</div>
+              <div style={{ color: GREY, fontSize: 12, marginTop: 2 }}>{s.label}</div>
+            </div>
+            <button className="tap" onClick={() => onStart(s.key)} style={{
+              background: "transparent", border: `1px solid ${RED}`, borderRadius: 20,
+              padding: "8px 18px", color: RED, fontSize: 13, fontWeight: 700, cursor: "pointer",
             }}>
-              {i === 0 ? "Start Workout" : "Start"}
+              Start
             </button>
           </div>
         );
@@ -736,7 +937,7 @@ function HomeScreen({ programs, onStart }) {
 }
 
 // ── History Screen ────────────────────────────────────────────────────────────
-function HistoryScreen({ history }) {
+function HistoryScreen({ history, units, onDelete }) {
   const [expanded, setExpanded] = useState(null);
   if (history.length === 0) {
     return (
@@ -747,29 +948,36 @@ function HistoryScreen({ history }) {
   }
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: "0 0 20px" }}>
-      <div style={{ color: GREY, fontSize: 13, padding: "16px 16px 4px", textTransform: "uppercase", letterSpacing: "0.06em" }}>Past workouts</div>
+      <div style={{ color: GREY, fontSize: 13, padding: "16px 16px 4px", textTransform: "uppercase", letterSpacing: "0.06em" }}>Past workouts · swipe left to delete</div>
       {history.map((h, i) => {
         const preview = h.exercises.slice(0, 3);
         const extra = h.exercises.length - 3;
         return (
-          <div key={i} style={{ background: CARD, borderRadius: 14, margin: "8px 16px 0", padding: "14px 16px", cursor: "pointer" }}
-            onClick={() => setExpanded(expanded === i ? null : i)}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-              <span style={{ color: GREY, fontSize: 14 }}>{h.progName}</span>
-              <span style={{ color: GREY, fontSize: 14 }}>{h.date}</span>
-            </div>
-            {(expanded === i ? h.exercises : preview).map((ex, j) => (
-              <div key={j} style={{ display: "flex", justifyContent: "space-between", paddingBottom: 5 }}>
-                <span style={{ color: WHITE, fontSize: 15 }}>
-                  {ex.name}
-                  {ex.success === true && <span style={{ color: GREEN }}> ✓</span>}
-                  {ex.success === false && <span style={{ color: "#ffb454" }}> !</span>}
-                </span>
-                <span style={{ color: WHITE, fontSize: 15 }}>{fmtWeight(ex)}</span>
+          <SwipeableRow key={i} onDelete={() => onDelete(i)} style={{ margin: "8px 16px 0" }}>
+            <div style={{ padding: "14px 16px", cursor: "pointer" }}
+              onClick={() => setExpanded(expanded === i ? null : i)}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                <span style={{ color: GREY, fontSize: 14 }}>{h.progName}</span>
+                <span style={{ color: GREY, fontSize: 14 }}>{h.date}</span>
               </div>
-            ))}
-            {expanded !== i && extra > 0 && <div style={{ color: GREY, fontSize: 13, marginTop: 4 }}>+{extra} exercises</div>}
-          </div>
+              {(expanded === i ? h.exercises : preview).map((ex, j) => (
+                <div key={j} style={{ display: "flex", justifyContent: "space-between", paddingBottom: 5 }}>
+                  <span style={{ color: WHITE, fontSize: 15 }}>
+                    {ex.name}
+                    {ex.success === true && <span style={{ color: GREEN }}> ✓</span>}
+                    {ex.success === false && <span style={{ color: "#ffb454" }}> !</span>}
+                  </span>
+                  <span style={{ color: WHITE, fontSize: 15 }}>{fmtWeight(ex, units)}</span>
+                </div>
+              ))}
+              {expanded !== i && extra > 0 && <div style={{ color: GREY, fontSize: 13, marginTop: 4 }}>+{extra} exercises</div>}
+              {expanded === i && h.note && (
+                <div style={{ color: GREY, fontSize: 13, fontStyle: "italic", marginTop: 8, paddingTop: 8, borderTop: `1px solid ${DIM}` }}>
+                  “{h.note}”
+                </div>
+              )}
+            </div>
+          </SwipeableRow>
         );
       })}
     </div>
@@ -777,7 +985,7 @@ function HistoryScreen({ history }) {
 }
 
 // ── Progress Screen ───────────────────────────────────────────────────────────
-function ProgressScreen({ history }) {
+function LiftsTab({ history, units }) {
   const [selected, setSelected] = useState(null);
 
   const liftMap = {};
@@ -785,22 +993,21 @@ function ProgressScreen({ history }) {
     h.exercises.forEach(ex => {
       if (ex.unit) return;
       if (!liftMap[ex.name]) liftMap[ex.name] = [];
-      liftMap[ex.name].push(ex.weight);
+      liftMap[ex.name].push(toDisplayWeight(ex.weight, units));
     });
   });
   const lifts = Object.entries(liftMap).map(([name, sessions]) => ({ name, sessions }));
 
   if (lifts.length === 0) {
     return (
-      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ padding: "40px 16px", textAlign: "center" }}>
         <span style={{ color: GREY, fontSize: 14 }}>Complete a workout to see progress</span>
       </div>
     );
   }
 
   return (
-    <div style={{ flex: 1, overflowY: "auto", padding: "0 0 20px" }}>
-      <div style={{ color: GREY, fontSize: 13, padding: "16px 16px 4px", textTransform: "uppercase", letterSpacing: "0.06em" }}>Lift progress</div>
+    <div>
       {lifts.map((l, i) => {
         const max  = Math.max(...l.sessions);
         const last = l.sessions[l.sessions.length - 1];
@@ -811,7 +1018,7 @@ function ProgressScreen({ history }) {
             onClick={() => setSelected(isOpen ? null : i)}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <span style={{ color: WHITE, fontSize: 15, fontWeight: 600 }}>{l.name}</span>
-              <span style={{ color: RED, fontSize: 15, fontWeight: 700 }}>{last} kg ›</span>
+              <span style={{ color: RED, fontSize: 15, fontWeight: 700 }}>{last} {units} ›</span>
             </div>
             {isOpen && (
               <div style={{ marginTop: 12 }}>
@@ -825,11 +1032,11 @@ function ProgressScreen({ history }) {
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
                   <span style={{ color: GREY, fontSize: 13 }}>Personal best</span>
-                  <span style={{ color: WHITE, fontSize: 13, fontWeight: 700 }}>{max} kg</span>
+                  <span style={{ color: WHITE, fontSize: 13, fontWeight: 700 }}>{max} {units}</span>
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
                   <span style={{ color: GREY, fontSize: 13 }}>Total gained</span>
-                  <span style={{ color: gain >= 0 ? GREEN : RED, fontSize: 13, fontWeight: 700 }}>+{gain} kg</span>
+                  <span style={{ color: gain >= 0 ? GREEN : RED, fontSize: 13, fontWeight: 700 }}>+{gain} {units}</span>
                 </div>
               </div>
             )}
@@ -840,39 +1047,220 @@ function ProgressScreen({ history }) {
   );
 }
 
+function BodyWeightTab({ bodyWeights, units, onLog, onDelete }) {
+  const [input, setInput] = useState("");
+  const sorted = [...bodyWeights].sort((a, b) => a.isoDate.localeCompare(b.isoDate));
+  const displaySorted = sorted.map(e => ({ ...e, displayWeight: toDisplayWeight(e.weight, units) }));
+  const reverseChron = [...displaySorted].reverse();
+  const max = displaySorted.length ? Math.max(...displaySorted.map(e => e.displayWeight)) : 0;
+  const min = displaySorted.length ? Math.min(...displaySorted.map(e => e.displayWeight)) : 0;
+  const range = max - min || 1;
+  const latest = reverseChron[0];
+  const first = displaySorted[0];
+  const change = latest && first ? Math.round((latest.displayWeight - first.displayWeight) * 10) / 10 : 0;
+
+  function submit() {
+    const val = parseFloat(input);
+    if (!val || val <= 0) return;
+    onLog(fromDisplayWeight(val, units));
+    setInput("");
+  }
+
+  return (
+    <div>
+      <div style={{ background: CARD, borderRadius: 14, margin: "8px 16px 0", padding: "14px 16px" }}>
+        <div style={{ color: GREY, fontSize: 12, marginBottom: 8 }}>Log today's body weight ({units})</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            type="text"
+            inputMode="decimal"
+            placeholder={units}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") submit(); }}
+            style={{
+              flex: 1, background: "#111", border: `1px solid ${DIM}`, borderRadius: 10,
+              padding: "10px 12px", color: WHITE, fontSize: 15, outline: "none",
+            }}
+          />
+          <button className="tap" onClick={submit} style={{
+            background: RED, border: "none", borderRadius: 10, padding: "0 20px",
+            color: WHITE, fontSize: 14, fontWeight: 700, cursor: "pointer",
+          }}>Log</button>
+        </div>
+      </div>
+
+      {sorted.length === 0 ? (
+        <div style={{ padding: "40px 16px", textAlign: "center" }}>
+          <span style={{ color: GREY, fontSize: 14 }}>No body weight logged yet</span>
+        </div>
+      ) : (
+        <>
+          <div style={{ background: CARD, borderRadius: 14, margin: "12px 16px 0", padding: "14px 16px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+              <span style={{ color: WHITE, fontSize: 15, fontWeight: 700 }}>{latest.displayWeight} {units}</span>
+              <span style={{ color: change === 0 ? GREY : change > 0 ? "#ffb454" : GREEN, fontSize: 13, fontWeight: 700 }}>
+                {change > 0 ? "+" : ""}{change} {units} since first log
+              </span>
+            </div>
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 4, height: 60 }}>
+              {displaySorted.slice(-14).map((e, j) => (
+                <div key={j} style={{ flex: 1, background: RED, opacity: 0.85, borderRadius: 3,
+                  height: `${8 + Math.round(((e.displayWeight - min) / range) * 44)}px` }} />
+              ))}
+            </div>
+          </div>
+          <div style={{ color: GREY, fontSize: 13, padding: "18px 16px 4px", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            History · swipe left to delete
+          </div>
+          {reverseChron.map((e, i) => (
+            <SwipeableRow key={e.isoDate} onDelete={() => onDelete(e.isoDate)} style={{ margin: "6px 16px 0" }}>
+              <div style={{ padding: "12px 16px", display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: GREY, fontSize: 14 }}>{e.date}</span>
+                <span style={{ color: WHITE, fontSize: 14, fontWeight: 600 }}>{e.displayWeight} {units}</span>
+              </div>
+            </SwipeableRow>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+function ProgressScreen({ history, bodyWeights, units, onLogBodyWeight, onDeleteBodyWeight }) {
+  const [tab, setTab] = useState("lifts");
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: "0 0 20px" }}>
+      <div style={{ display: "flex", gap: 8, padding: "16px 16px 4px" }}>
+        {[{ id: "lifts", label: "Lifts" }, { id: "bodyweight", label: "Body Weight" }].map(t => (
+          <button key={t.id} className="tap" onClick={() => setTab(t.id)} style={{
+            flex: 1, background: tab === t.id ? RED : CARD, border: "none",
+            borderRadius: 20, padding: "9px 0", color: tab === t.id ? WHITE : GREY,
+            fontSize: 13, fontWeight: 700, cursor: "pointer",
+          }}>{t.label}</button>
+        ))}
+      </div>
+      {tab === "lifts"
+        ? <LiftsTab history={history} units={units} />
+        : <BodyWeightTab bodyWeights={bodyWeights} units={units} onLog={onLogBodyWeight} onDelete={onDeleteBodyWeight} />}
+    </div>
+  );
+}
+
 // ── Programs Screen ───────────────────────────────────────────────────────────
-function ProgramsScreen({ programs }) {
+function ProgramsScreen({ programs, units, onUpdateExercise, onRemoveExercise, onMoveExercise, onAddExercise, onRenameProgram }) {
+  const [editingKey, setEditingKey] = useState(null);
+
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
       <div style={{ color: GREY, fontSize: 13, marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.06em" }}>My Programs</div>
-      {Object.entries(programs).map(([key, prog]) => (
-        <div key={key} style={{ background: CARD, borderRadius: 14, padding: "14px 16px", marginBottom: 10 }}>
-          <div style={{ color: WHITE, fontSize: 16, fontWeight: 700, marginBottom: 8 }}>{prog.name}</div>
-          {prog.exercises.map((ex, i) => (
-            <div key={i} style={{ display: "flex", justifyContent: "space-between", paddingBottom: 5 }}>
-              <span style={{ color: GREY, fontSize: 14 }}>{ex.name}</span>
-              <span style={{ color: RED, fontSize: 14, fontWeight: 600 }}>{fmtWeight(ex)}</span>
+      {Object.entries(programs).map(([key, prog]) => {
+        const isEditing = editingKey === key;
+        return (
+          <div key={key} style={{ background: CARD, borderRadius: 14, padding: "14px 16px", marginBottom: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              {isEditing ? (
+                <input
+                  defaultValue={prog.name}
+                  onBlur={e => onRenameProgram(key, e.target.value || prog.name)}
+                  style={{ background: "none", border: "none", borderBottom: `1px solid ${RED}`, color: WHITE, fontSize: 16, fontWeight: 700, outline: "none", flex: 1, marginRight: 10 }}
+                />
+              ) : (
+                <span style={{ color: WHITE, fontSize: 16, fontWeight: 700 }}>{prog.name}</span>
+              )}
+              <button className="tap" onClick={() => setEditingKey(isEditing ? null : key)} style={{
+                background: "none", border: `1px solid ${isEditing ? GREEN : RED}`, borderRadius: 16,
+                padding: "5px 14px", color: isEditing ? GREEN : RED, fontSize: 12, fontWeight: 700, cursor: "pointer",
+              }}>
+                {isEditing ? "Done" : "Edit"}
+              </button>
             </div>
-          ))}
-        </div>
-      ))}
+
+            {prog.exercises.map((ex, i) => (
+              isEditing ? (
+                <div key={i} style={{ background: "#111", borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                    <input
+                      defaultValue={ex.name}
+                      onBlur={e => onUpdateExercise(key, i, "name", e.target.value || ex.name)}
+                      style={{ flex: 1, background: "none", border: "none", borderBottom: `1px solid ${DIM}`, color: WHITE, fontSize: 14, fontWeight: 600, outline: "none", padding: "2px 0" }}
+                    />
+                    <span onClick={() => onMoveExercise(key, i, -1)} style={{ color: i === 0 ? DIM : GREY, fontSize: 16, cursor: i === 0 ? "default" : "pointer", padding: "0 4px" }}>▲</span>
+                    <span onClick={() => onMoveExercise(key, i, 1)} style={{ color: i === prog.exercises.length - 1 ? DIM : GREY, fontSize: 16, cursor: i === prog.exercises.length - 1 ? "default" : "pointer", padding: "0 4px" }}>▼</span>
+                    <span onClick={() => prog.exercises.length > 1 && onRemoveExercise(key, i)} style={{ color: prog.exercises.length > 1 ? "#ff6b6b" : DIM, fontSize: 18, cursor: prog.exercises.length > 1 ? "pointer" : "default", padding: "0 4px" }}>×</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <input type="text" inputMode="numeric" defaultValue={ex.sets}
+                        onBlur={e => onUpdateExercise(key, i, "sets", parseInt(e.target.value, 10) || ex.sets)}
+                        style={{ width: 30, background: "none", border: "none", borderBottom: `1px solid ${DIM}`, color: RED, fontSize: 14, fontWeight: 700, textAlign: "center", outline: "none" }} />
+                      <span style={{ color: GREY, fontSize: 11 }}>sets</span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <input type="text" inputMode="numeric" defaultValue={ex.reps}
+                        onBlur={e => onUpdateExercise(key, i, "reps", parseInt(e.target.value, 10) || ex.reps)}
+                        style={{ width: 30, background: "none", border: "none", borderBottom: `1px solid ${DIM}`, color: RED, fontSize: 14, fontWeight: 700, textAlign: "center", outline: "none" }} />
+                      <span style={{ color: GREY, fontSize: 11 }}>{ex.unit === "sec" ? "sec" : "reps"}</span>
+                    </div>
+                    {ex.unit !== "sec" && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                        <input type="text" inputMode="decimal" defaultValue={toDisplayWeight(ex.weight, units)}
+                          onBlur={e => onUpdateExercise(key, i, "weight", fromDisplayWeight(parseFloat(e.target.value) || 0, units))}
+                          style={{ width: 44, background: "none", border: "none", borderBottom: `1px solid ${DIM}`, color: RED, fontSize: 14, fontWeight: 700, textAlign: "center", outline: "none" }} />
+                        <span style={{ color: GREY, fontSize: 11 }}>{units}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", paddingBottom: 5 }}>
+                  <span style={{ color: GREY, fontSize: 14 }}>{ex.name}</span>
+                  <span style={{ color: RED, fontSize: 14, fontWeight: 600 }}>{fmtWeight(ex, units)}</span>
+                </div>
+              )
+            ))}
+
+            {isEditing && (
+              <button className="tap" onClick={() => onAddExercise(key)} style={{
+                width: "100%", marginTop: 4, background: "transparent", border: `1px dashed ${DIM}`,
+                borderRadius: 10, padding: "10px 0", color: GREY, fontSize: 13, fontWeight: 600, cursor: "pointer",
+              }}>
+                + Add Exercise
+              </button>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
 
 // ── Settings Screen ───────────────────────────────────────────────────────────
-function SettingsScreen({ onReset }) {
+function SettingsScreen({ units, onSetUnits, onReset, onExport, onImport }) {
+  const fileInputRef = useRef(null);
   const rows = [
-    { label: "Units",          value: "kg"                         },
     { label: "Rest Timer",     value: "2:00 min"                   },
     { label: "Progression",    value: `+${PROGRESSION_INCREMENT} kg / session` },
     { label: "Deload",         value: `-10% after ${FAILS_BEFORE_DELOAD} fails` },
-    { label: "Plates",         value: "1.25 · 2.5 · 5 · 10 · 15 · 20 · 25" },
-    { label: "Barbell Weight", value: `${BARBELL_WEIGHT} kg`       },
+    { label: "Plates",         value: units === "lb" ? "2.5 · 5 · 10 · 25 · 35 · 45" : "1.25 · 2.5 · 5 · 10 · 15 · 20 · 25" },
+    { label: "Barbell Weight", value: units === "lb" ? "45 lb" : "20 kg" },
   ];
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
       <div style={{ color: GREY, fontSize: 13, marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.06em" }}>Settings</div>
+
+      <div style={{ background: CARD, borderRadius: 14, padding: "14px 16px", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ color: WHITE, fontSize: 15 }}>Units</span>
+        <div style={{ display: "flex", background: "#111", borderRadius: 20, padding: 3 }}>
+          {["kg", "lb"].map(u => (
+            <button key={u} className="tap" onClick={() => onSetUnits(u)} style={{
+              background: units === u ? RED : "transparent", border: "none", borderRadius: 18,
+              padding: "6px 18px", color: units === u ? WHITE : GREY, fontSize: 13, fontWeight: 700, cursor: "pointer",
+            }}>{u}</button>
+          ))}
+        </div>
+      </div>
+
       <div style={{ background: CARD, borderRadius: 14, overflow: "hidden" }}>
         {rows.map((r, i) => (
           <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", borderBottom: i < rows.length - 1 ? `1px solid ${DIM}` : "none" }}>
@@ -881,12 +1269,35 @@ function SettingsScreen({ onReset }) {
           </div>
         ))}
       </div>
-      <button onClick={onReset} style={{
-        width: "100%", marginTop: 20, background: "transparent",
+
+      <div style={{ color: GREY, fontSize: 13, margin: "20px 0 8px", textTransform: "uppercase", letterSpacing: "0.06em" }}>Backup</div>
+      <button className="tap" onClick={onExport} style={{
+        width: "100%", background: "transparent", border: `1px solid ${DIM}`, borderRadius: 12,
+        padding: "12px 0", color: WHITE, fontSize: 14, fontWeight: 600, cursor: "pointer", marginBottom: 8,
+      }}>Export Data (JSON)</button>
+      <button className="tap" onClick={() => fileInputRef.current && fileInputRef.current.click()} style={{
+        width: "100%", background: "transparent", border: `1px solid ${DIM}`, borderRadius: 12,
+        padding: "12px 0", color: WHITE, fontSize: 14, fontWeight: 600, cursor: "pointer",
+      }}>Restore from File</button>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="application/json"
+        style={{ display: "none" }}
+        onChange={e => {
+          const file = e.target.files && e.target.files[0];
+          if (file) onImport(file);
+          e.target.value = "";
+        }}
+      />
+
+      <div style={{ color: GREY, fontSize: 13, margin: "20px 0 8px", textTransform: "uppercase", letterSpacing: "0.06em" }}>Danger Zone</div>
+      <button className="tap" onClick={onReset} style={{
+        width: "100%", background: "transparent",
         border: `1px solid ${RED}`, borderRadius: 12, padding: "12px 0",
         color: RED, fontSize: 14, fontWeight: 600, cursor: "pointer",
       }}>Reset All Data</button>
-      <div style={{ color: GREY, fontSize: 12, textAlign: "center", marginTop: 16 }}>StrongLifts Clone · v1.3</div>
+      <div style={{ color: GREY, fontSize: 12, textAlign: "center", marginTop: 16 }}>StrongLifts Clone · v1.4</div>
     </div>
   );
 }
@@ -905,6 +1316,8 @@ function App() {
   const [loaded, setLoaded]               = useState(false);
   const [programs, setPrograms]           = useState(DEFAULT_PROGRAMS);
   const [history, setHistory]             = useState([]);
+  const [bodyWeights, setBodyWeights]     = useState([]);
+  const [units, setUnits]                 = useState("kg");
   const [screen, setScreen]               = useState("home");
   const [activeWorkout, setActiveWorkout] = useState(null);
   const [prevScreen, setPrevScreen]       = useState("home");
@@ -915,14 +1328,105 @@ function App() {
     if (saved) {
       if (saved.programs) setPrograms(saved.programs);
       if (saved.history) setHistory(saved.history);
+      if (saved.bodyWeights) setBodyWeights(saved.bodyWeights);
+      if (saved.units) setUnits(saved.units);
     }
     setLoaded(true);
   }, []);
 
   useEffect(() => {
     if (!loaded) return;
-    saveState({ programs, history });
-  }, [programs, history, loaded]);
+    saveState({ programs, history, bodyWeights, units });
+  }, [programs, history, bodyWeights, units, loaded]);
+
+  function logBodyWeight(weight) {
+    const now = new Date();
+    const isoDate = now.toISOString().slice(0, 10);
+    const dateLabel = now.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+    setBodyWeights(prev => {
+      const existingIdx = prev.findIndex(e => e.isoDate === isoDate);
+      if (existingIdx >= 0) {
+        const copy = [...prev];
+        copy[existingIdx] = { ...copy[existingIdx], weight };
+        return copy;
+      }
+      return [...prev, { isoDate, date: dateLabel, weight }];
+    });
+  }
+
+  function deleteBodyWeightEntry(isoDate) {
+    setBodyWeights(prev => prev.filter(e => e.isoDate !== isoDate));
+  }
+
+  function deleteHistoryEntry(idx) {
+    setHistory(prev => prev.filter((_, i) => i !== idx));
+  }
+
+  function updateExerciseField(progKey, exIdx, field, value) {
+    setPrograms(prev => {
+      const prog = prev[progKey];
+      const exs = prog.exercises.map((ex, i) => i === exIdx ? { ...ex, [field]: value } : ex);
+      return { ...prev, [progKey]: { ...prog, exercises: exs } };
+    });
+  }
+
+  function removeExercise(progKey, exIdx) {
+    setPrograms(prev => {
+      const prog = prev[progKey];
+      return { ...prev, [progKey]: { ...prog, exercises: prog.exercises.filter((_, i) => i !== exIdx) } };
+    });
+  }
+
+  function moveExercise(progKey, exIdx, dir) {
+    setPrograms(prev => {
+      const prog = prev[progKey];
+      const newIdx = exIdx + dir;
+      if (newIdx < 0 || newIdx >= prog.exercises.length) return prev;
+      const exs = [...prog.exercises];
+      [exs[exIdx], exs[newIdx]] = [exs[newIdx], exs[exIdx]];
+      return { ...prev, [progKey]: { ...prog, exercises: exs } };
+    });
+  }
+
+  function addExercise(progKey) {
+    setPrograms(prev => {
+      const prog = prev[progKey];
+      return { ...prev, [progKey]: { ...prog, exercises: [...prog.exercises, { name: "New Exercise", sets: 3, reps: 8, weight: 20 }] } };
+    });
+  }
+
+  function renameProgram(progKey, name) {
+    setPrograms(prev => ({ ...prev, [progKey]: { ...prev[progKey], name } }));
+  }
+
+  function exportData() {
+    const data = JSON.stringify({ programs, history, bodyWeights, units }, null, 2);
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `stronglifts-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function importData(file) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (data.programs) setPrograms(data.programs);
+        if (data.history) setHistory(data.history);
+        if (data.bodyWeights) setBodyWeights(data.bodyWeights);
+        if (data.units) setUnits(data.units);
+      } catch (err) {
+        alert("That file doesn't look like a valid backup.");
+      }
+    };
+    reader.readAsText(file);
+  }
 
   function startWorkout(key) {
     setPrevScreen(screen);
@@ -930,13 +1434,13 @@ function App() {
     setScreen("active");
   }
 
-  function handleWeightsChange(progKey, weights, done) {
-    pendingWeights.current = { progKey, weights, done };
+  function handleWeightsChange(progKey, weights, done, note) {
+    pendingWeights.current = { progKey, weights, done, note };
   }
 
   function finishWorkout() {
     if (pendingWeights.current && pendingWeights.current.progKey === activeWorkout) {
-      const { weights, done } = pendingWeights.current;
+      const { weights, done, note } = pendingWeights.current;
       setPrograms(prev => {
         const next = { ...prev };
         const prog = next[activeWorkout];
@@ -967,10 +1471,13 @@ function App() {
           success: attemptedCount > 0 ? allFull : null,
         };
       });
+      const now = new Date();
       setHistory(prev => [{
         progKey: activeWorkout,
         progName: prog.name,
-        date: new Date().toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }),
+        date: now.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }),
+        isoDate: now.toISOString().slice(0, 10),
+        note: (note || "").trim(),
         exercises: loggedExercises,
       }, ...prev]);
     }
@@ -991,6 +1498,8 @@ function App() {
   function handleReset() {
     setPrograms(DEFAULT_PROGRAMS);
     setHistory([]);
+    setBodyWeights([]);
+    setUnits("kg");
     setActiveWorkout(null);
     setScreen("home");
     try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
@@ -1027,6 +1536,7 @@ function App() {
             <WorkoutScreen
               progKey={activeWorkout}
               programs={programs}
+              units={units}
               onFinish={finishWorkout}
               onBack={goBack}
               onWeightsChange={handleWeightsChange}
@@ -1034,18 +1544,44 @@ function App() {
           )}
         </div>
 
-        {!isActive && screen === "home"     && <HomeScreen programs={programs} onStart={startWorkout} />}
-        {!isActive && screen === "programs" && <ProgramsScreen programs={programs} />}
-        {!isActive && screen === "history"  && <HistoryScreen history={history} />}
-        {!isActive && screen === "progress" && <ProgressScreen history={history} />}
-        {!isActive && screen === "settings" && <SettingsScreen onReset={handleReset} />}
+        {!isActive && screen === "home"     && <HomeScreen programs={programs} history={history} units={units} onStart={startWorkout} />}
+        {!isActive && screen === "programs" && (
+          <ProgramsScreen
+            programs={programs}
+            units={units}
+            onUpdateExercise={updateExerciseField}
+            onRemoveExercise={removeExercise}
+            onMoveExercise={moveExercise}
+            onAddExercise={addExercise}
+            onRenameProgram={renameProgram}
+          />
+        )}
+        {!isActive && screen === "history"  && <HistoryScreen history={history} units={units} onDelete={deleteHistoryEntry} />}
+        {!isActive && screen === "progress" && (
+          <ProgressScreen
+            history={history}
+            bodyWeights={bodyWeights}
+            units={units}
+            onLogBodyWeight={logBodyWeight}
+            onDeleteBodyWeight={deleteBodyWeightEntry}
+          />
+        )}
+        {!isActive && screen === "settings" && (
+          <SettingsScreen
+            units={units}
+            onSetUnits={setUnits}
+            onReset={handleReset}
+            onExport={exportData}
+            onImport={importData}
+          />
+        )}
       </div>
 
       <div style={{ background: CARD, borderTop: `1px solid ${DIM}`, display: "flex", justifyContent: "space-around", padding: "8px 0 12px", flexShrink: 0 }}>
         {navItems.map(n => {
           const isSelected = isActive ? n.id === "home" : screen === n.id;
           return (
-            <button key={n.id} onClick={() => navigate(n.id)} style={{
+            <button key={n.id} className="tap" onClick={() => navigate(n.id)} style={{
               background: "none", border: "none", cursor: "pointer",
               display: "flex", flexDirection: "column", alignItems: "center", gap: 3,
               color: isSelected ? RED : GREY,
