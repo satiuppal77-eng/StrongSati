@@ -123,6 +123,33 @@ const WHITE = "#ffffff";
 const DIM   = "#3a3a3c";
 const GREEN = "#34c759";
 const ORANGE = "#f97316";
+const RUN_BLUE = "#5ac8fa";
+
+const RUN_PLAN = [1, 1.5, 2, 3, 4, 5, 6, 7, 8.5, 10].map((target, week) => ({
+  week: week + 1,
+  target,
+  sessions: [
+    { type: "Easy", distance: Math.max(1, Math.round(target * 0.55 * 10) / 10), tip: "Relaxed pace — you should be able to talk." },
+    { type: "Intervals", distance: Math.max(1, Math.round(target * 0.7 * 10) / 10), tip: "Alternate 2 minutes steady with 1 minute easy." },
+    { type: "Long run", distance: target, tip: "Slow down and focus on completing the distance." },
+  ],
+}));
+
+function haversineKm(a, b) {
+  const rad = x => x * Math.PI / 180;
+  const earth = 6371;
+  const dLat = rad(b.lat - a.lat);
+  const dLon = rad(b.lon - a.lon);
+  const q = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return earth * 2 * Math.atan2(Math.sqrt(q), Math.sqrt(1 - q));
+}
+
+function fmtRunTime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, "0");
+  const s = (seconds % 60).toString().padStart(2, "0");
+  return h ? `${h}:${m}:${s}` : `${m}:${s}`;
+}
 
 // ── Warmup calculator ─────────────────────────────────────────────────────────
 function calcWarmups(workingWeight, bar = BARBELL_WEIGHT) {
@@ -1147,6 +1174,134 @@ function ProgressScreen({ history, bodyWeights, units, onLogBodyWeight, onDelete
   );
 }
 
+// ── Running plan and GPS tracker ─────────────────────────────────────────────
+function ActiveRun({ session, onSave, onCancel }) {
+  const [status, setStatus] = useState("ready");
+  const [seconds, setSeconds] = useState(0);
+  const [distance, setDistance] = useState(0);
+  const [gpsMessage, setGpsMessage] = useState("GPS starts when you press Start");
+  const watchRef = useRef(null);
+  const timerRef = useRef(null);
+  const lastPointRef = useRef(null);
+
+  useEffect(() => () => {
+    if (watchRef.current !== null && navigator.geolocation) navigator.geolocation.clearWatch(watchRef.current);
+    if (timerRef.current) clearInterval(timerRef.current);
+  }, []);
+
+  function beginTracking() {
+    setStatus("running");
+    setGpsMessage("Finding GPS…");
+    timerRef.current = setInterval(() => setSeconds(s => s + 1), 1000);
+    if (!navigator.geolocation) {
+      setGpsMessage("GPS is not supported on this device");
+      return;
+    }
+    watchRef.current = navigator.geolocation.watchPosition(pos => {
+      const point = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+      if (pos.coords.accuracy > 60) {
+        setGpsMessage(`Weak GPS (${Math.round(pos.coords.accuracy)}m)`);
+        return;
+      }
+      setGpsMessage(`GPS connected · ±${Math.round(pos.coords.accuracy)}m`);
+      if (lastPointRef.current) {
+        const step = haversineKm(lastPointRef.current, point);
+        if (step > 0.003 && step < 0.2) setDistance(d => d + step);
+      }
+      lastPointRef.current = point;
+    }, err => {
+      setGpsMessage(err.code === 1 ? "Location permission is needed to track distance" : "Waiting for a stronger GPS signal");
+    }, { enableHighAccuracy: true, maximumAge: 2000, timeout: 12000 });
+  }
+
+  function pause() {
+    if (status === "running") {
+      setStatus("paused");
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+      if (watchRef.current !== null) navigator.geolocation.clearWatch(watchRef.current);
+      watchRef.current = null;
+      lastPointRef.current = null;
+    } else beginTracking();
+  }
+
+  function finish() {
+    if (seconds < 10 && !confirm("This run is very short. Save it anyway?")) return;
+    if (watchRef.current !== null && navigator.geolocation) navigator.geolocation.clearWatch(watchRef.current);
+    if (timerRef.current) clearInterval(timerRef.current);
+    onSave({ ...session, seconds, distance: Math.round(distance * 100) / 100 });
+  }
+
+  const paceSecs = distance > 0.05 ? Math.round(seconds / distance) : 0;
+  const progress = Math.min(100, Math.round((distance / session.distance) * 100));
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: "18px 16px 28px" }}>
+      <button className="tap" onClick={onCancel} style={{ background: "none", border: "none", color: GREY, fontSize: 15, padding: 0, cursor: "pointer" }}>‹ Back</button>
+      <div style={{ color: RUN_BLUE, fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.08em", marginTop: 24 }}>Week {session.week} · {session.type}</div>
+      <div style={{ color: WHITE, fontSize: 28, fontWeight: 800, marginTop: 6 }}>{session.distance}K target</div>
+      <div style={{ background: CARD, borderRadius: 20, padding: "24px 18px", marginTop: 24, textAlign: "center" }}>
+        <div style={{ color: WHITE, fontSize: 58, lineHeight: 1, fontWeight: 800, fontVariantNumeric: "tabular-nums" }}>{distance.toFixed(2)}</div>
+        <div style={{ color: GREY, fontSize: 13, marginTop: 7, textTransform: "uppercase", letterSpacing: "0.08em" }}>kilometres</div>
+        <div style={{ height: 7, background: DIM, borderRadius: 10, overflow: "hidden", marginTop: 22 }}><div style={{ height: "100%", width: `${progress}%`, background: RUN_BLUE, transition: "width .3s" }} /></div>
+        <div style={{ display: "flex", justifyContent: "space-around", marginTop: 24 }}>
+          <div><div style={{ color: WHITE, fontSize: 24, fontWeight: 700 }}>{fmtRunTime(seconds)}</div><div style={{ color: GREY, fontSize: 11, marginTop: 4 }}>TIME</div></div>
+          <div><div style={{ color: WHITE, fontSize: 24, fontWeight: 700 }}>{paceSecs ? fmtRunTime(paceSecs) : "--:--"}</div><div style={{ color: GREY, fontSize: 11, marginTop: 4 }}>PACE /KM</div></div>
+        </div>
+      </div>
+      <div style={{ color: gpsMessage.includes("connected") ? GREEN : GREY, fontSize: 12, textAlign: "center", marginTop: 12 }}>{gpsMessage}</div>
+      {status === "ready" ? <button className="tap" onClick={beginTracking} style={{ width: "100%", marginTop: 20, background: RUN_BLUE, border: "none", borderRadius: 28, padding: "16px 0", color: "#001018", fontSize: 17, fontWeight: 800, cursor: "pointer" }}>Start Run</button> :
+        <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+          <button className="tap" onClick={pause} style={{ flex: 1, background: DIM, border: "none", borderRadius: 28, padding: "15px 0", color: WHITE, fontSize: 16, fontWeight: 700, cursor: "pointer" }}>{status === "running" ? "Pause" : "Resume"}</button>
+          <button className="tap" onClick={finish} style={{ flex: 1, background: RUN_BLUE, border: "none", borderRadius: 28, padding: "15px 0", color: "#001018", fontSize: 16, fontWeight: 800, cursor: "pointer" }}>Finish</button>
+        </div>}
+      <div style={{ color: GREY, fontSize: 12, lineHeight: 1.5, textAlign: "center", marginTop: 18 }}>Keep your phone with you and the screen open for the most reliable tracking.</div>
+    </div>
+  );
+}
+
+function RunningScreen({ runHistory, onSaveRun }) {
+  const [selected, setSelected] = useState(null);
+  const completed = new Set(runHistory.map(r => `${r.week}-${r.sessionIndex}`));
+  const next = RUN_PLAN.flatMap(w => w.sessions.map((s, i) => ({ ...s, week: w.week, target: w.target, sessionIndex: i }))).find(s => !completed.has(`${s.week}-${s.sessionIndex}`));
+  const [openWeek, setOpenWeek] = useState(next ? next.week : 10);
+  if (selected) return <ActiveRun session={selected} onCancel={() => setSelected(null)} onSave={run => { onSaveRun(run); setSelected(null); }} />;
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", paddingBottom: 24 }}>
+      <div style={{ margin: "14px 16px 0", padding: "20px 18px", borderRadius: 18, background: "linear-gradient(135deg,#075985,#0ea5e9)" }}>
+        <div style={{ color: "#dff6ff", fontSize: 12, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase" }}>StrongSati Run</div>
+        <div style={{ color: WHITE, fontSize: 27, fontWeight: 800, marginTop: 7 }}>From 1K to 10K</div>
+        <div style={{ color: "#dff6ff", fontSize: 14, lineHeight: 1.45, marginTop: 7 }}>10 weeks · 3 runs each week · progress at your pace</div>
+        {next && <button className="tap" onClick={() => setSelected(next)} style={{ width: "100%", marginTop: 18, background: WHITE, border: "none", borderRadius: 24, padding: "12px 0", color: "#075985", fontSize: 15, fontWeight: 800, cursor: "pointer" }}>Start next: {next.distance}K {next.type}</button>}
+      </div>
+      <div style={{ display: "flex", gap: 8, margin: "12px 16px 4px" }}>
+        <div style={{ flex: 1, background: CARD, borderRadius: 12, padding: 12 }}><div style={{ color: RUN_BLUE, fontSize: 22, fontWeight: 800 }}>{runHistory.length}/30</div><div style={{ color: GREY, fontSize: 11, marginTop: 3 }}>RUNS DONE</div></div>
+        <div style={{ flex: 1, background: CARD, borderRadius: 12, padding: 12 }}><div style={{ color: RUN_BLUE, fontSize: 22, fontWeight: 800 }}>{runHistory.reduce((n, r) => n + (r.distance || 0), 0).toFixed(1)}K</div><div style={{ color: GREY, fontSize: 11, marginTop: 3 }}>TOTAL DISTANCE</div></div>
+      </div>
+      <div style={{ color: GREY, fontSize: 12, padding: "16px 16px 5px", textTransform: "uppercase", letterSpacing: "0.07em" }}>Your plan</div>
+      {RUN_PLAN.map(w => {
+        const doneCount = w.sessions.filter((_, i) => completed.has(`${w.week}-${i}`)).length;
+        const open = openWeek === w.week;
+        return <div key={w.week} style={{ background: CARD, borderRadius: 14, margin: "7px 16px 0", overflow: "hidden" }}>
+          <div onClick={() => setOpenWeek(open ? null : w.week)} style={{ padding: "13px 15px", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}>
+            <div><div style={{ color: WHITE, fontSize: 15, fontWeight: 700 }}>Week {w.week} · Build to {w.target}K</div><div style={{ color: GREY, fontSize: 12, marginTop: 3 }}>{doneCount} of 3 runs complete</div></div>
+            <span style={{ color: doneCount === 3 ? GREEN : RUN_BLUE, fontSize: 18 }}>{doneCount === 3 ? "✓" : open ? "⌃" : "⌄"}</span>
+          </div>
+          {open && w.sessions.map((s, i) => {
+            const isDone = completed.has(`${w.week}-${i}`);
+            return <div key={i} style={{ borderTop: `1px solid ${DIM}`, padding: "12px 15px", display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+              <div><div style={{ color: isDone ? GREEN : WHITE, fontSize: 14, fontWeight: 650 }}>{isDone ? "✓ " : ""}{s.type} · {s.distance}K</div><div style={{ color: GREY, fontSize: 11, lineHeight: 1.35, marginTop: 3 }}>{s.tip}</div></div>
+              {!isDone && <button className="tap" onClick={() => setSelected({ ...s, week: w.week, target: w.target, sessionIndex: i })} style={{ flexShrink: 0, background: "transparent", border: `1px solid ${RUN_BLUE}`, borderRadius: 18, padding: "7px 13px", color: RUN_BLUE, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Start</button>}
+            </div>;
+          })}
+        </div>;
+      })}
+      {runHistory.length > 0 && <><div style={{ color: GREY, fontSize: 12, padding: "20px 16px 5px", textTransform: "uppercase", letterSpacing: "0.07em" }}>Recent runs</div>{runHistory.slice(0, 5).map((r, i) => <div key={i} style={{ margin: "7px 16px 0", background: CARD, borderRadius: 12, padding: "12px 15px", display: "flex", justifyContent: "space-between" }}><div><div style={{ color: WHITE, fontSize: 14, fontWeight: 650 }}>Week {r.week} · {r.type}</div><div style={{ color: GREY, fontSize: 11, marginTop: 3 }}>{r.date}</div></div><div style={{ textAlign: "right" }}><div style={{ color: RUN_BLUE, fontSize: 14, fontWeight: 750 }}>{Number(r.distance).toFixed(2)}K</div><div style={{ color: GREY, fontSize: 11, marginTop: 3 }}>{fmtRunTime(r.seconds)}</div></div></div>)}</>}
+    </div>
+  );
+}
+
 // ── Programs Screen ───────────────────────────────────────────────────────────
 function ProgramsScreen({ programs, units, onUpdateExercise, onRemoveExercise, onMoveExercise, onAddExercise, onRenameProgram }) {
   const [editingKey, setEditingKey] = useState(null);
@@ -1305,6 +1460,7 @@ function SettingsScreen({ units, onSetUnits, onReset, onExport, onImport }) {
 // ── Bottom Nav ────────────────────────────────────────────────────────────────
 const NAV = [
   { id: "home",     label: "Home",     icon: "⌂" },
+  { id: "running",  label: "Run",      icon: "●" },
   { id: "programs", label: "Programs", icon: "☰" },
   { id: "history",  label: "History",  icon: "◷" },
   { id: "progress", label: "Progress", icon: "↗" },
@@ -1317,6 +1473,7 @@ function App() {
   const [programs, setPrograms]           = useState(DEFAULT_PROGRAMS);
   const [history, setHistory]             = useState([]);
   const [bodyWeights, setBodyWeights]     = useState([]);
+  const [runHistory, setRunHistory]       = useState([]);
   const [units, setUnits]                 = useState("kg");
   const [screen, setScreen]               = useState("home");
   const [activeWorkout, setActiveWorkout] = useState(null);
@@ -1329,6 +1486,7 @@ function App() {
       if (saved.programs) setPrograms(saved.programs);
       if (saved.history) setHistory(saved.history);
       if (saved.bodyWeights) setBodyWeights(saved.bodyWeights);
+      if (saved.runHistory) setRunHistory(saved.runHistory);
       if (saved.units) setUnits(saved.units);
     }
     setLoaded(true);
@@ -1336,8 +1494,13 @@ function App() {
 
   useEffect(() => {
     if (!loaded) return;
-    saveState({ programs, history, bodyWeights, units });
-  }, [programs, history, bodyWeights, units, loaded]);
+    saveState({ programs, history, bodyWeights, runHistory, units });
+  }, [programs, history, bodyWeights, runHistory, units, loaded]);
+
+  function saveRun(run) {
+    const now = new Date();
+    setRunHistory(prev => [{ ...run, date: now.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }), isoDate: now.toISOString() }, ...prev]);
+  }
 
   function logBodyWeight(weight) {
     const now = new Date();
@@ -1400,7 +1563,7 @@ function App() {
   }
 
   function exportData() {
-    const data = JSON.stringify({ programs, history, bodyWeights, units }, null, 2);
+    const data = JSON.stringify({ programs, history, bodyWeights, runHistory, units }, null, 2);
     const blob = new Blob([data], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1420,6 +1583,7 @@ function App() {
         if (data.programs) setPrograms(data.programs);
         if (data.history) setHistory(data.history);
         if (data.bodyWeights) setBodyWeights(data.bodyWeights);
+        if (data.runHistory) setRunHistory(data.runHistory);
         if (data.units) setUnits(data.units);
       } catch (err) {
         alert("That file doesn't look like a valid backup.");
@@ -1499,6 +1663,7 @@ function App() {
     setPrograms(DEFAULT_PROGRAMS);
     setHistory([]);
     setBodyWeights([]);
+    setRunHistory([]);
     setUnits("kg");
     setActiveWorkout(null);
     setScreen("home");
@@ -1545,6 +1710,7 @@ function App() {
         </div>
 
         {!isActive && screen === "home"     && <HomeScreen programs={programs} history={history} units={units} onStart={startWorkout} />}
+        {!isActive && screen === "running"  && <RunningScreen runHistory={runHistory} onSaveRun={saveRun} />}
         {!isActive && screen === "programs" && (
           <ProgramsScreen
             programs={programs}
